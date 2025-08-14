@@ -1,28 +1,39 @@
 #!/usr/bin/env node
 import { WebSocket } from "ws";
 import type { RawData } from "ws";
-import { cryptoWaitReady, encodeAddress } from "@polkadot/util-crypto";
+import {
+  cryptoWaitReady,
+  encodeAddress,
+  xxhashAsU8a,
+} from "@polkadot/util-crypto";
 import { BN } from "@polkadot/util";
-import { UInt } from "@polkadot/types-codec";
 import { TypeRegistry } from "@polkadot/types/create";
 import { Metadata } from "@polkadot/types/metadata";
-import { xxhashAsU8a } from "@polkadot/util-crypto";
+import { UInt } from "@polkadot/types-codec";
 
 /** ---------- CLI args ---------- */
 const usage = `usage:
-  decode-block-extrinsics <ws-url> <block-number-or-hash>
+  decode-block-extrinsics <ws-url> <block-number-or-hash> [--format=lines|pretty]
 
 examples:
   decode-block-extrinsics wss://a.t.res.fm 129430
-  decode-block-extrinsics wss://a.t.res.fm 0xd939e389d83c1bdd5414032d6b4c7529278cf9e7d19931e533fae899c6bbcc6c
+  decode-block-extrinsics wss://a.t.res.fm 0xd939e389d83c1bdd5414032d6b4c7529278cf9e7d19931e533fae899c6bbcc6c --format=pretty
 `;
 
-const args = process.argv.slice(2).filter((a) => a !== "--");
-if (args.length !== 2) {
+// normalize args & options
+const argv = process.argv.slice(2).filter((a) => a !== "--");
+if (argv.length < 2) {
   console.error(usage);
   process.exit(1);
 }
-const [wsUrl, blockArg] = args;
+const [wsUrl, blockArg, ...rest] = argv;
+
+type OutputFormat = "lines" | "pretty";
+let format: OutputFormat = "lines";
+for (const opt of rest) {
+  const m = /^--format=(lines|pretty)$/.exec(opt);
+  if (m) format = m[1] as OutputFormat;
+}
 
 /** ---------- Tiny JSON-RPC over WS ---------- */
 class Rpc {
@@ -77,7 +88,7 @@ class Rpc {
   }
 }
 
-/** ---------- SCALE helpers (metadata-free) ---------- */
+/** ---------- SCALE helpers ---------- */
 function hexToU8a(hex: string): Uint8Array {
   const s = hex.startsWith("0x") ? hex.slice(2) : hex;
   if (s.length % 2) throw new Error("Invalid hex");
@@ -169,9 +180,7 @@ function buildCallIndexMap(metaHex: string) {
   const metadata = new Metadata(registry, hexToU8a(metaHex));
   registry.setMetadata(metadata);
 
-  // v14 pallets live under asLatest.pallets
-  const pallets = (metadata as any).asLatest.pallets as any[];
-
+  const pallets: any[] = (metadata as any).asLatest.pallets;
   const callMap = new Map<number, CallInfo>();
 
   pallets.forEach((p: any) => {
@@ -179,39 +188,34 @@ function buildCallIndexMap(metaHex: string) {
       const idx = Number(p.index.toNumber());
       const name = p.name.toString();
 
-      // In v14, calls.unwrap().type is a Lookup type ID into the scale-info registry
-      const callTypeId = p.calls.unwrap().type; // Compact<SiLookupTypeId>
+      // v14: calls.unwrap().type is SiLookupTypeId
+      const callTypeId = p.calls.unwrap().type;
       const siType = registry.lookup.getSiType(callTypeId);
 
-      // Ensure the looked-up type is a Variant and collect its variants
       const names = new Map<number, string>();
       let count = 0;
 
       if (siType?.def?.isVariant) {
         const variants = siType.def.asVariant.variants;
         count = variants.length;
-        variants.forEach((v: any, i: number) => {
-          names.set(i, v.name.toString());
-        });
-      } else {
-        // No variants => no callable dispatchables on this pallet
-        count = 0;
+        variants.forEach((v: any, i: number) =>
+          names.set(i, v.name.toString()),
+        );
       }
-
       callMap.set(idx, { name, callsCount: count, callNameByIndex: names });
     }
   });
 
   const ss58FromMeta: number | undefined = (registry as any).chainSS58;
-
   return { registry, metadata, callMap, ss58FromMeta };
 }
 
+/** align to call header by validating (pallet, call) against metadata */
 function findCallHeaderWithMeta(
   a: Uint8Array,
   start: number,
   callMap: Map<number, { callsCount: number }>,
-  scanLimit = 2048,
+  scanLimit = 4096,
 ) {
   for (let sh = 0; sh <= scanLimit; sh++) {
     const i = start + sh;
@@ -224,7 +228,15 @@ function findCallHeaderWithMeta(
   return null;
 }
 
-// Build the storage key for System.Events: twox128("System") ++ twox128("Events")
+/** ---------- Events helpers ---------- */
+type TransferEvt = {
+  from: string;
+  to: string;
+  amountPlanck: string;
+  amountHuman?: string;
+};
+type FeePaidEvt = { payer: string; amountPlanck: string; amountHuman?: string };
+
 function systemEventsStorageKey(): `0x${string}` {
   const p = xxhashAsU8a("System", 128);
   const m = xxhashAsU8a("Events", 128);
@@ -234,58 +246,71 @@ function systemEventsStorageKey(): `0x${string}` {
   return ("0x" + Buffer.from(key).toString("hex")) as `0x${string}`;
 }
 
-type TransferEvt = { from: string; to: string; amount: string };
-
 function decodeEventsAtBlock(
   registry: TypeRegistry,
   metadata: Metadata,
   eventsHex: string,
   ss58: number,
-): Map<number, { transfers: TransferEvt[] }> {
-  registry.setMetadata(metadata); // ensure types are active
-
-  // register custom big-int used by this chain's events
+  decimals: number,
+): Map<number, { transfers: TransferEvt[]; feePaid?: FeePaidEvt }> {
+  registry.setMetadata(metadata);
+  // register chain’s big int type used in events (U512 on Resonance)
   registry.register({ U512: (UInt.with as any)(512) });
 
   const bytes = hexToU8a(eventsHex);
-  // Vec<EventRecord>
   const EventRecords = (registry as any).createType(
     "Vec<EventRecord>",
     bytes,
   ) as any;
-  const byExtrinsic = new Map<number, { transfers: TransferEvt[] }>();
+
+  const byEx = new Map<
+    number,
+    { transfers: TransferEvt[]; feePaid?: FeePaidEvt }
+  >();
+
   for (const rec of EventRecords as any[]) {
-    const phase = rec.phase; // Phase
-    const event = rec.event; // { section, method, data }
+    const phase = rec.phase;
+    const event = rec.event;
     const section =
       event.section?.toString?.() ?? event.pallet?.toString?.() ?? "";
     const method =
       event.method?.toString?.() ?? event.variant?.toString?.() ?? "";
 
-    // Only events that are tied to a specific extrinsic
     if (!phase.isApplyExtrinsic) continue;
     const idx = phase.asApplyExtrinsic.toNumber();
 
     if (section.toLowerCase() === "balances" && method === "Transfer") {
-      // balances::Transfer(AccountId, AccountId, Balance)
       const [from, to, amount] = event.data as any[];
-      const fromId = from.toU8a();
-      const toId = to.toU8a();
+      const amtStr = amount.toBn ? amount.toBn().toString() : amount.toString();
       const t: TransferEvt = {
-        from: encodeAddress(fromId, ss58),
-        to: encodeAddress(toId, ss58),
-        amount: amount.toBn ? amount.toBn().toString() : amount.toString(),
+        from: encodeAddress(from.toU8a(), ss58),
+        to: encodeAddress(to.toU8a(), ss58),
+        amountPlanck: amtStr,
+        amountHuman: `${toHuman(amtStr, decimals)}`,
       };
-      const entry = byExtrinsic.get(idx) ?? { transfers: [] };
-      entry.transfers.push(t);
-      byExtrinsic.set(idx, entry);
+      const e = byEx.get(idx) ?? { transfers: [] };
+      e.transfers.push(t);
+      byEx.set(idx, e);
+    }
+
+    if (section === "TransactionPayment" && method === "TransactionFeePaid") {
+      // (AccountId, Balance)
+      const [payer, fee] = event.data as any[];
+      const feeStr = fee.toBn ? fee.toBn().toString() : fee.toString();
+      const f: FeePaidEvt = {
+        payer: encodeAddress(payer.toU8a(), ss58),
+        amountPlanck: feeStr,
+        amountHuman: `${toHuman(feeStr, decimals)}`,
+      };
+      const e = byEx.get(idx) ?? { transfers: [] };
+      e.feePaid = f;
+      byEx.set(idx, e);
     }
   }
-
-  return byExtrinsic;
+  return byEx;
 }
 
-/** ---------- Parser using metadata for alignment ---------- */
+/** ---------- Parser (PQ-safe, metadata-aligned) ---------- */
 type Parsed = {
   ok: boolean;
   rawLength: number;
@@ -295,16 +320,13 @@ type Parsed = {
   section?: string;
   method?: string;
   sender?: string;
-  recipient?: string;
-  amountPlanck?: string;
-  amountHuman?: string;
   tipPlanck?: string;
   tipHuman?: string;
   nonce?: string;
-  error?: string;
+  // we no longer try to extract transfer args from the call unless it *is* balances.transfer*
 };
 
-function parseExtrinsic(
+function parseExtrinsicHeaderAndCall(
   hex: string,
   ss58: number,
   decimals: number,
@@ -333,26 +355,21 @@ function parseExtrinsic(
     if (isSigned) {
       const [signer, sRead] = readMultiAddress(x, i);
       i += sRead;
-      if (signer.type === "Id") sender = encodeAddress(signer.id, ss58);
-
-      // Signature as SCALE Bytes (PQ-safe: we don't care about its internals)
+      if ((signer as any).type === "Id")
+        sender = encodeAddress((signer as any).id, ss58);
       const [_sig, sigRead] = readScaleBytes(x, i);
-      i += sigRead;
-
+      i += sigRead; // opaque PQ-safe sig
       const [_era, eraRead] = readEra(x, i);
       i += eraRead;
-
       const [_nonce, nRead] = readCompactInt(x, i);
       i += nRead;
       nonce = _nonce;
       const [_tip, tRead] = readCompactInt(x, i);
       i += tRead;
       tip = _tip;
-
-      // Do NOT assume anything else — use metadata to align to call header
+      // signed extensions beyond tip are ignored; we align using metadata next
     }
 
-    // Align to the call header by validating (pallet, call) against metadata
     const slimMap = new Map<number, { callsCount: number }>(
       [...callMap.entries()].map(([k, v]) => [k, { callsCount: v.callsCount }]),
     );
@@ -360,7 +377,7 @@ function parseExtrinsic(
 
     if (!found) {
       return {
-        ok: true,
+        ok: false,
         rawLength: L,
         version,
         isSigned,
@@ -380,26 +397,6 @@ function parseExtrinsic(
     const section = info?.name;
     const method = info?.callNameByIndex.get(callIndex) ?? `call_${callIndex}`;
 
-    let recipient: string | undefined;
-    let amountPlanck: string | undefined;
-
-    // Decode balances transfer-like args
-    if (
-      /^balances$/i.test(section) &&
-      /^(transfer|transferKeepAlive|transferAllowDeath)$/i.test(method)
-    ) {
-      try {
-        const [dest, dRead] = readMultiAddress(x, i);
-        i += dRead;
-        if (dest.type === "Id") recipient = encodeAddress(dest.id, ss58);
-        const [amt, aRead] = readCompactInt(x, i);
-        i += aRead;
-        amountPlanck = amt.toString();
-      } catch {
-        /* leave undefined */
-      }
-    }
-
     return {
       ok: true,
       rawLength: L,
@@ -409,11 +406,6 @@ function parseExtrinsic(
       section,
       method,
       sender,
-      recipient,
-      amountPlanck,
-      amountHuman: amountPlanck
-        ? `${toHuman(amountPlanck, decimals)} ${symbol}`
-        : undefined,
       tipPlanck: tip?.toString(),
       tipHuman: tip ? `${toHuman(tip, decimals)} ${symbol}` : undefined,
       nonce: nonce?.toString(),
@@ -426,7 +418,7 @@ function parseExtrinsic(
       isSigned: false,
       callIndex: { pallet: 0, call: 0 },
       error: e?.message ?? String(e),
-    };
+    } as any;
   }
 }
 
@@ -434,20 +426,19 @@ function parseExtrinsic(
 (async () => {
   await cryptoWaitReady();
   const rpc = new Rpc(wsUrl);
+  let hadDecodeFailure = false;
 
   try {
     await rpc.connect();
 
     // Resolve block hash
     let blockHash: string;
-    if (/^0x[0-9a-fA-F]{64}$/.test(blockArg)) {
-      blockHash = blockArg;
-    } else if (/^\d+$/.test(blockArg)) {
-      const numHex = "0x" + BigInt(blockArg).toString(16);
-      blockHash = await rpc.call("chain_getBlockHash", [numHex]);
-    } else {
-      throw new Error("Block must be a decimal number or 0x-hash");
-    }
+    if (/^0x[0-9a-fA-F]{64}$/.test(blockArg)) blockHash = blockArg;
+    else if (/^\d+$/.test(blockArg))
+      blockHash = await rpc.call("chain_getBlockHash", [
+        "0x" + BigInt(blockArg).toString(16),
+      ]);
+    else throw new Error("Block must be a decimal number or 0x-hash");
 
     // Chain props
     const props = await rpc.call("system_properties");
@@ -479,77 +470,165 @@ function parseExtrinsic(
       ? (ss58FromMeta as number)
       : ss58Format;
 
-    // Fetch & decode System.Events at this block
+    // Events at this block (for transfers & actual fee paid)
     const eventsKey = systemEventsStorageKey();
-    const eventsHex: string = await rpc.call("state_getStorageAt", [
+    const eventsHex: string | null = await rpc.call("state_getStorageAt", [
       eventsKey,
       blockHash,
     ]);
-    // Note: some nodes use state_getStorage (no At). We already use the At variant.
-
     const eventsByExtrinsic = eventsHex
-      ? decodeEventsAtBlock(registry, metadata, eventsHex, ss58)
-      : new Map<number, { transfers: TransferEvt[] }>();
+      ? decodeEventsAtBlock(registry, metadata, eventsHex, ss58, decimals)
+      : new Map<number, { transfers: TransferEvt[]; feePaid?: FeePaidEvt }>();
 
-    console.log(
-      JSON.stringify(
-        {
-          blockNumber: number,
-          blockHash,
-          extrinsicsCount: extrinsics.length,
-          symbol,
+    // Prepare outputs
+    const header = {
+      blockNumber: number,
+      blockHash,
+      extrinsicsCount: extrinsics.length,
+      symbol,
+      decimals,
+      ss58Format: ss58,
+    };
+
+    if (format === "pretty") {
+      const pretties: any[] = [];
+      for (let idx = 0; idx < extrinsics.length; idx++) {
+        const hex = extrinsics[idx];
+        const p = parseExtrinsicHeaderAndCall(
+          hex,
+          ss58,
           decimals,
-          ss58Format: ss58,
-        },
-        null,
-        2,
-      ),
-    );
+          callMap,
+          symbol,
+        );
+        if (!p.ok) hadDecodeFailure = true;
 
-    // Decode each extrinsic
-    for (let idx = 0; idx < extrinsics.length; idx++) {
-      const hex = extrinsics[idx];
-      const p = parseExtrinsic(hex, ss58, decimals, callMap, symbol);
+        // fee/weight
+        let weight: { refTime?: string; proofSize?: string } | undefined;
+        let partialFeePlanck: string | undefined;
+        let partialFeeHuman: string | undefined;
+        try {
+          let info: any;
+          try {
+            info = await rpc.call("payment_queryInfo", [hex, blockHash]);
+          } catch {
+            info = await rpc.call("payment_queryInfo", [hex]);
+          }
+          const w = info?.weight || info?.weightV2 || {};
+          const refTime = w?.refTime?.toString?.();
+          const proofSize = w?.proofSize?.toString?.();
+          if (refTime || proofSize) weight = { refTime, proofSize };
+          if (info?.partialFee != null) {
+            const pf = new BN(info.partialFee.toString());
+            partialFeePlanck = pf.toString();
+            partialFeeHuman = `${toHuman(pf, decimals)} ${symbol}`;
+          }
+        } catch {}
 
-      // Fill from events if missing
-      let recipient = p.recipient;
-      let amountPlanck = p.amountPlanck;
-      let amountHuman = p.amountHuman;
+        const ev = eventsByExtrinsic.get(idx);
+        const transfers = ev?.transfers?.map((t) => ({
+          from: t.from,
+          to: t.to,
+          amountPlanck: t.amountPlanck,
+          amountHuman: `${t.amountHuman} ${symbol}`,
+        }));
+        const feePaid = ev?.feePaid
+          ? {
+              payer: ev.feePaid.payer,
+              amountPlanck: ev.feePaid.amountPlanck,
+              amountHuman: `${ev.feePaid.amountHuman} ${symbol}`,
+            }
+          : undefined;
 
-      // Get fee/weight using block context (preferred 2-arg; fallback 1-arg)
-      let weight: { refTime?: string; proofSize?: string } | undefined;
-      let partialFeePlanck: string | undefined;
-      let partialFeeHuman: string | undefined;
-
-      const ev = eventsByExtrinsic.get(idx);
-      if ((!recipient || !amountPlanck) && ev && ev.transfers.length > 0) {
-        // If multiple transfers, you can choose the first or aggregate; the explorer likely shows the primary one.
-        const t = ev.transfers[0];
-        recipient = t.to;
-        amountPlanck = t.amount;
-        amountHuman = `${toHuman(t.amount, decimals)} ${symbol}`;
+        pretties.push({
+          index: idx,
+          ok: p.ok,
+          isSigned: p.isSigned,
+          section: p.section,
+          method: p.method,
+          callIndex: p.callIndex,
+          sender: p.sender,
+          tipPlanck: p.tipPlanck,
+          tipHuman: p.tipHuman,
+          nonce: p.nonce,
+          transfers,
+          feePaid,
+          weight,
+          partialFeePlanck,
+          partialFeeHuman,
+        });
       }
+      console.log(JSON.stringify({ header, extrinsics: pretties }, null, 2));
+    } else {
+      // lines mode
+      console.log(JSON.stringify(header, null, 2));
+      for (let idx = 0; idx < extrinsics.length; idx++) {
+        const hex = extrinsics[idx];
+        const p = parseExtrinsicHeaderAndCall(
+          hex,
+          ss58,
+          decimals,
+          callMap,
+          symbol,
+        );
+        if (!p.ok) hadDecodeFailure = true;
 
-      const out = {
-        index: idx,
-        ok: p.ok,
-        isSigned: p.isSigned,
-        section: p.section,
-        method: p.method,
-        callIndex: p.callIndex,
-        sender: p.sender,
-        recipient,
-        amountPlanck,
-        amountHuman,
-        tipPlanck: p.tipPlanck,
-        tipHuman: p.tipHuman,
-        nonce: p.nonce,
-        weight,
-        partialFeePlanck,
-        partialFeeHuman,
-        error: p.error,
-      };
-      console.log(JSON.stringify(out));
+        // fee/weight
+        let weight: { refTime?: string; proofSize?: string } | undefined;
+        let partialFeePlanck: string | undefined;
+        let partialFeeHuman: string | undefined;
+        try {
+          let info: any;
+          try {
+            info = await rpc.call("payment_queryInfo", [hex, blockHash]);
+          } catch {
+            info = await rpc.call("payment_queryInfo", [hex]);
+          }
+          const w = info?.weight || info?.weightV2 || {};
+          const refTime = w?.refTime?.toString?.();
+          const proofSize = w?.proofSize?.toString?.();
+          if (refTime || proofSize) weight = { refTime, proofSize };
+          if (info?.partialFee != null) {
+            const pf = new BN(info.partialFee.toString());
+            partialFeePlanck = pf.toString();
+            partialFeeHuman = `${toHuman(pf, decimals)} ${symbol}`;
+          }
+        } catch {}
+
+        const ev = eventsByExtrinsic.get(idx);
+        const transfers = ev?.transfers?.map((t) => ({
+          from: t.from,
+          to: t.to,
+          amountPlanck: t.amountPlanck,
+          amountHuman: `${t.amountHuman} ${symbol}`,
+        }));
+        const feePaid = ev?.feePaid
+          ? {
+              payer: ev.feePaid.payer,
+              amountPlanck: ev.feePaid.amountPlanck,
+              amountHuman: `${ev.feePaid.amountHuman} ${symbol}`,
+            }
+          : undefined;
+
+        const out = {
+          index: idx,
+          ok: p.ok,
+          isSigned: p.isSigned,
+          section: p.section,
+          method: p.method,
+          callIndex: p.callIndex,
+          sender: p.sender,
+          tipPlanck: p.tipPlanck,
+          tipHuman: p.tipHuman,
+          nonce: p.nonce,
+          transfers,
+          feePaid,
+          weight,
+          partialFeePlanck,
+          partialFeeHuman,
+        };
+        console.log(JSON.stringify(out));
+      }
     }
   } catch (e: any) {
     console.error("error:", e?.message ?? e);
@@ -557,4 +636,6 @@ function parseExtrinsic(
   } finally {
     await rpc.close();
   }
+
+  if (hadDecodeFailure) process.exit(2);
 })();
